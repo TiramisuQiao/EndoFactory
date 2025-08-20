@@ -9,6 +9,11 @@ Revolutionary tool for constructing EndoVQA datasets through YAML configuration.
 ## Quick Start
 
 ### 1. Installation
+If you just want the cli, pip it!
+```bash
+pip install endofactory -i https://pypi.org/simple
+```
+Or if you want to be contributor,
 ```bash
 git clone <repository-url>
 cd EndoFactory
