@@ -1,0 +1,64 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+wheelhouse/
+
+# Poetry
+poetry.lock
+.cache/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VSCode / IDE
+.vscode/
+.idea/
+*.swp
+test_data/
+# Local data / outputs
+output/
+assets/*.png
+!assets/logo.png
+!assets/logo_small.png
+test_data/**/images/
+
+env/
+.venv/
+
+# Logs
+logs/
+*.log
+.yaml
