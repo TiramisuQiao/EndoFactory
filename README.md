@@ -1,19 +1,24 @@
 # EndoFactory 🏭
 
-<p align="center">
-  <img src="assets/logo.png" alt="EndoFactory Logo" width="220" />
-</p>
+![EndoFactory Logo](assets/logo.png)
 
 Revolutionary tool for constructing EndoVQA datasets through YAML configuration.
+
+
+[![codecov](https://codecov.io/github/TiramisuQiao/EndoFactory/graph/badge.svg?token=N4SZ3BLO4P)](https://codecov.io/github/TiramisuQiao/EndoFactory)
 
 ## Quick Start
 
 ### 1. Installation
+
 If you just want the cli, pip it!
+
 ```bash
 pip install endofactory -i https://pypi.org/simple
 ```
+
 Or if you want to be contributor,
+
 ```bash
 git clone <repository-url>
 cd EndoFactory
@@ -21,16 +26,19 @@ poetry install
 ```
 
 ### 2. Generate Test Data
+
 ```bash
 poetry run python tests/test_data_generator.py
 ```
 
 ### 3. Create Configuration
+
 ```bash
 poetry run python -m endofactory.cli create-config --output config.yaml
 ```
 
 ### 4. Edit Configuration
+
 ```yaml
 datasets:
   - name: endoscopy_vqa_v1
@@ -62,11 +70,13 @@ export:
 ```
 
 ### 5. Build Dataset
+
 ```bash
 poetry run python -m endofactory.cli build config.yaml --verbose
 ```
 
 ### 6. View Results
+
 ```bash
 poetry run python -m endofactory.cli view output/endovqa_dataset.parquet
 ```
@@ -74,25 +84,33 @@ poetry run python -m endofactory.cli view output/endovqa_dataset.parquet
 ## CLI Commands
 
 ### `create-config`
+
 Generate example configuration file
+
 ```bash
 endofactory create-config [--output CONFIG_PATH]
 ```
 
 ### `build`
+
 Build mixed dataset from configuration
+
 ```bash
 endofactory build CONFIG_PATH [--verbose]
 ```
 
 ### `stats`
+
 Show dataset statistics
+
 ```bash
 endofactory stats CONFIG_PATH
 ```
 
 ### `view`
+
 Visualize parquet file structure and data
+
 ```bash
 endofactory view PARQUET_FILE [--rows N] [--columns]
 ```
@@ -100,7 +118,9 @@ endofactory view PARQUET_FILE [--rows N] [--columns]
 ## Configuration Options
 
 ### Dataset Weights
+
 Control proportion of each dataset in final mix:
+
 ```yaml
 datasets:
   - name: dataset_a
@@ -110,7 +130,9 @@ datasets:
 ```
 
 ### Task Proportions
+
 Control distribution of different task types:
+
 ```yaml
 task_proportions:
   task_proportions:
@@ -124,7 +146,9 @@ task_proportions:
 ```
 
 ### Global Columns
+
 Specify columns to extract (missing columns filled with null):
+
 ```yaml
 columns:
   - uuid
@@ -145,7 +169,7 @@ columns:
 
 ## Project Structure
 
-```
+```bash
 EndoFactory/
 ├── src/endofactory/
 │   ├── __init__.py
@@ -167,4 +191,3 @@ EndoFactory/
 ## License
 
 MIT License
-

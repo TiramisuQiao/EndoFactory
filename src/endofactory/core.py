@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Union, Any
 import polars as pl
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import EndoFactoryConfig, DatasetConfig
 
 
@@ -23,38 +24,46 @@ class EndoFactoryEngine:
             self.datasets[dataset_config.name] = df
             
     def _load_single_dataset(self, dataset_config: DatasetConfig) -> pl.DataFrame:
-        """Load a single dataset from parquet file or directly from JSON."""
-        # Load from parquet if available, otherwise ingest from JSON directly
+        """Load a single dataset from parquet file or directly from JSON.
+
+        Performance:
+        - For parquet sources, use column pushdown via read_parquet(columns=...).
+        - For JSON sources, use parallel parsing.
+        """
+        # Decide columns up-front for pushdown
+        columns_to_extract = self.config.columns or dataset_config.columns
+
         if dataset_config.parquet_path and Path(dataset_config.parquet_path).exists():
-            df = pl.read_parquet(dataset_config.parquet_path)
+            # Column pushdown to reduce IO
+            try:
+                df = pl.read_parquet(dataset_config.parquet_path, columns=columns_to_extract)
+            except Exception:
+                # Fallback without columns in case of schema mismatch
+                df = pl.read_parquet(dataset_config.parquet_path)
         elif dataset_config.json_dir:
             df = self._ingest_dataset_from_json(dataset_config)
+            # Apply column filter post-ingest if requested
+            if columns_to_extract:
+                # Select existing + add nulls for missing
+                existing = [c for c in columns_to_extract if c in df.columns]
+                missing = [c for c in columns_to_extract if c not in df.columns]
+                df = df.select(existing + [pl.lit(None).alias(c) for c in missing])
         else:
             raise ValueError(f"Dataset {dataset_config.name}: neither parquet_path exists nor json_dir provided")
-        
-        # Use global columns configuration or dataset-specific columns
-        columns_to_extract = self.config.columns or dataset_config.columns
-        
-        # Filter and standardize columns if specified
-        if columns_to_extract:
-            # Create a new dataframe with only the requested columns
-            # If a column doesn't exist, fill with null values
-            column_exprs = []
-            for col in columns_to_extract:
-                if col in df.columns:
-                    column_exprs.append(pl.col(col))
-                else:
-                    # Create null column for missing columns
-                    column_exprs.append(pl.lit(None).alias(col))
-            df = df.select(column_exprs)
-        
+
         # Add dataset name column only if user wants it (in columns) or no column filter is set
         if columns_to_extract is None or (isinstance(columns_to_extract, list) and "source_dataset" in columns_to_extract):
             df = df.with_columns(pl.lit(dataset_config.name).alias("source_dataset"))
-        
+
+        # Optional categorical casting to reduce memory
+        if self.config.categorical_columns:
+            castable = [c for c in self.config.categorical_columns if c in df.columns]
+            if castable:
+                df = df.with_columns([pl.col(c).cast(pl.Categorical) for c in castable])
+
         # Validate image paths and update absolute paths
         df = self._validate_and_update_image_paths(df, dataset_config)
-        
+
         return df
 
     # ============ Ingestion (ColonGPT) ============
@@ -77,54 +86,18 @@ class EndoFactoryEngine:
         if not json_dir.exists():
             raise FileNotFoundError(f"JSON dir not found: {json_dir}")
 
-        records: List[Dict[str, Any]] = []
-        # Scan all json files under json_dir (recursive)
-        for p in json_dir.rglob('*.json'):
-            try:
-                with open(p, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception as e:
-                raise RuntimeError(f"Failed to read JSON {p}: {e}")
-
-            # Each file may contain a list (recommended) or a single object
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                # Required fields from example: id, image, conversations
-                if not all(k in it for k in ('id', 'image', 'conversations')):
-                    # Skip invalid entries
-                    continue
-
-                rec: Dict[str, Any] = {
-                    'id': it['id'],
-                    'image': it['image'],
-                    'conversations': it['conversations'],
-                }
-
-                # Optional derive image_path
-                if input_cfg.image_path_mode == 'join_id':
-                    # id is a relative path; join with images_root
-                    assert input_cfg.images_root is not None
-                    rec['image_path'] = str(Path(input_cfg.images_root) / it['id'])
-                elif input_cfg.image_path_mode == 'use_existing':
-                    # image field is already an absolute path
-                    # keep as-is; do not add image_path
-                    pass
-
-                # Add a stable uuid for this row
-                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
-
-                records.append(rec)
+        records = self._scan_json_records(
+            json_dir=json_dir,
+            derive_image_mode=input_cfg.image_path_mode,
+            images_root=input_cfg.images_root,
+            dataset_prefix=input_cfg.dataset_prefix,
+            num_workers=self.config.num_workers,
+        )
 
         if not records:
             raise ValueError("No valid ColonGPT records found from input JSONs.")
 
         df = pl.from_dicts(records)
-
-        # Optional filter by dataset prefix (id startswith '<prefix>/')
-        if input_cfg.dataset_prefix:
-            pref = input_cfg.dataset_prefix.rstrip('/') + '/'
-            if 'id' in df.columns:
-                df = df.filter(pl.col('id').str.starts_with(pref))
 
         # Save to parquet
         out_path = Path(ingest_out.parquet_path)
@@ -141,54 +114,79 @@ class EndoFactoryEngine:
         if not json_dir.exists():
             raise FileNotFoundError(f"JSON dir not found: {json_dir}")
 
-        records: List[Dict[str, Any]] = []
-        # Scan all json files under json_dir (recursive)
-        for p in json_dir.rglob('*.json'):
-            try:
-                with open(p, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except Exception as e:
-                raise RuntimeError(f"Failed to read JSON {p}: {e}")
-
-            # Each file may contain a list (recommended) or a single object
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                # Required fields from example: id, image, conversations
-                if not all(k in it for k in ('id', 'image', 'conversations')):
-                    # Skip invalid entries
-                    continue
-
-                rec: Dict[str, Any] = {
-                    'id': it['id'],
-                    'image': it['image'],
-                    'conversations': it['conversations'],
-                }
-
-                # Optional derive image_path
-                if dataset_config.auto_absolute_path:
-                    # id is a relative path; join with images_root
-                    rec['image_path'] = str(Path(dataset_config.image_path) / it['id'])
-                elif 'image' in it and Path(it['image']).is_absolute():
-                    # image field is already an absolute path
-                    rec['image_path'] = it['image']
-
-                # Add a stable uuid for this row
-                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
-
-                records.append(rec)
+        records = self._scan_json_records(
+            json_dir=json_dir,
+            derive_image_mode='join_id' if dataset_config.auto_absolute_path else 'use_existing',
+            images_root=dataset_config.image_path,
+            dataset_prefix=dataset_config.dataset_prefix,
+            num_workers=self.config.num_workers,
+        )
 
         if not records:
             raise ValueError(f"No valid ColonGPT records found from JSON dir: {json_dir}")
 
         df = pl.from_dicts(records)
 
-        # Optional filter by dataset prefix (id startswith '<prefix>/')
-        if dataset_config.dataset_prefix:
-            pref = dataset_config.dataset_prefix.rstrip('/') + '/'
-            if 'id' in df.columns:
-                df = df.filter(pl.col('id').str.starts_with(pref))
-
         return df
+
+    # ---------------- Internal helpers ----------------
+    def _scan_json_records(
+        self,
+        json_dir: Path,
+        derive_image_mode: str,
+        images_root: Optional[Path],
+        dataset_prefix: Optional[str],
+        num_workers: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        """Scan JSON files in parallel and return normalized records.
+
+        Expected JSON per file: either a list of items or a single object.
+        Each item must contain: id, image, conversations.
+        """
+        files = list(json_dir.rglob('*.json'))
+        if not files:
+            return []
+
+        def parse_file(p: Path) -> List[Dict[str, Any]]:
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read JSON {p}: {e}")
+
+            items = data if isinstance(data, list) else [data]
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                if not all(k in it for k in ('id', 'image', 'conversations')):
+                    continue
+                rec: Dict[str, Any] = {
+                    'id': it['id'],
+                    'image': it['image'],
+                    'conversations': it['conversations'],
+                }
+                # derive image_path if needed
+                if derive_image_mode == 'join_id' and images_root is not None:
+                    rec['image_path'] = str(Path(images_root) / it['id'])
+                elif derive_image_mode == 'use_existing' and 'image' in it and Path(it['image']).is_absolute():
+                    rec['image_path'] = it['image']
+
+                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
+                out.append(rec)
+            return out
+
+        max_workers = num_workers if (num_workers and num_workers > 0) else min(32, len(files)) or 1
+        results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(parse_file, p): p for p in files}
+            for fut in as_completed(futures):
+                results.extend(fut.result())
+
+        # Optional prefix filter
+        if dataset_prefix:
+            pref = dataset_prefix.rstrip('/') + '/'
+            results = [r for r in results if str(r.get('id', '')).startswith(pref)]
+
+        return results
     
     def _validate_and_update_image_paths(self, df: pl.DataFrame, dataset_config: DatasetConfig) -> pl.DataFrame:
         """Validate image existence and create absolute paths."""

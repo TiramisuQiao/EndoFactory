@@ -125,6 +125,15 @@ class EndoFactoryConfig(BaseModel):
     # Optional ingestion configs
     input: Optional[InputConfig] = Field(default=None, description="Optional raw input ingestion configuration")
     ingest_output: Optional[IngestOutputConfig] = Field(default=None, description="Optional ingestion output configuration")
+    # Performance-related options
+    num_workers: Optional[int] = Field(
+        default=None,
+        description="Optional number of worker threads for parallel JSON reading. If None, uses a sensible default.",
+    )
+    categorical_columns: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of column names to cast to categorical to reduce memory footprint.",
+    )
     
     class Config:
         extra = "forbid"

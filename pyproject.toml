@@ -38,6 +38,7 @@ packages = [{include = "endofactory", from = "src"}]
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
 pytest-benchmark = ">=4.0"
+pytest-cov = ">=4.1"
 
 [project.scripts]
 endofactory = "endofactory.cli:app"
@@ -53,8 +54,15 @@ markers = [
   "performance: marks performance tests (deselect with '-m \"not performance\"')",
 ]
 
+[tool.coverage.run]
+omit = [
+  "src/endofactory/cli.py",
+  "src/endofactory/yaml_loader.py"
+]
+
 [project.optional-dependencies]
 tests = [
   "pytest>=7.0",
   "pytest-benchmark>=4.0",
+  "pytest-cov>=4.1",
 ]

@@ -48,8 +48,8 @@ def test_validate_and_update_image_paths_uuid():
     engine = make_engine_with_datasets({"ds": df})
     out = engine._validate_and_update_image_paths(df, ds_cfg)
 
-    assert "absolute_image_path" in out.columns
-    assert out["absolute_image_path"].to_list() == [
+    assert "image_path" in out.columns
+    assert out["image_path"].to_list() == [
         "/root/images/a.jpg",
         "/root/images/b.jpg",
     ]
@@ -67,7 +67,7 @@ def test_validate_and_update_image_paths_filename():
     engine = make_engine_with_datasets({"ds": df})
     out = engine._validate_and_update_image_paths(df, ds_cfg)
 
-    assert out["absolute_image_path"].to_list() == [
+    assert out["image_path"].to_list() == [
         "/imgs/x.png",
         "/imgs/y.jpeg",
     ]
@@ -78,9 +78,9 @@ def test_mix_datasets_weight_effect():
     df1 = pl.DataFrame({"id": list(range(100))})
     df2 = pl.DataFrame({"id": list(range(200))})
 
-    # Weights 1 and 3 -> total_weight=4
-    # sample_size = int(len(df) * (weight/total_weight))
-    # expected: df1 -> int(100*0.25)=25, df2 -> int(200*0.75)=150
+    # With new semantics:
+    # w==1.0 -> include full dataset (100)
+    # w==3.0 -> upsample to int(n*w)=int(200*3)=600
     datasets_cfg = [
         DatasetConfig(name="d1", image_path=Path("/i1"), parquet_path=Path("/p1.parquet"), weight=1.0),
         DatasetConfig(name="d2", image_path=Path("/i2"), parquet_path=Path("/p2.parquet"), weight=3.0),
@@ -99,10 +99,8 @@ def test_mix_datasets_weight_effect():
     mixed = engine.mix_datasets()
     assert mixed is not None
 
-    # Check sizes contributed roughly match expected without relying on column that marks origin
-    # We added no source_dataset column since we bypassed _load_single_dataset.
-    # So just check total size equals expected sum.
-    assert len(mixed) == 25 + 150
+    # Check total size equals expected sum.
+    assert len(mixed) == 100 + 600
 
 
 def test_apply_task_proportions_basic():
