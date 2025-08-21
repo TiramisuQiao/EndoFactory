@@ -1,6 +1,6 @@
 [project]
 name = "endofactory"
-version = "0.1.1"
+version = "0.1.2"
 description = "Revolutionary EndoVQA dataset construction tool for rapid dataset mixing and configuration"
 authors = [
     {name = "TiramisuQiao",email = "tlmsq@outlook.com"}

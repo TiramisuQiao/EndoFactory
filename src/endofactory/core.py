@@ -2,7 +2,7 @@
 
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Any
 import polars as pl
 import json
 from .config import EndoFactoryConfig, DatasetConfig
@@ -23,9 +23,14 @@ class EndoFactoryEngine:
             self.datasets[dataset_config.name] = df
             
     def _load_single_dataset(self, dataset_config: DatasetConfig) -> pl.DataFrame:
-        """Load a single dataset from parquet file."""
-        # Load parquet file
-        df = pl.read_parquet(dataset_config.parquet_path)
+        """Load a single dataset from parquet file or directly from JSON."""
+        # Load from parquet if available, otherwise ingest from JSON directly
+        if dataset_config.parquet_path and Path(dataset_config.parquet_path).exists():
+            df = pl.read_parquet(dataset_config.parquet_path)
+        elif dataset_config.json_dir:
+            df = self._ingest_dataset_from_json(dataset_config)
+        else:
+            raise ValueError(f"Dataset {dataset_config.name}: neither parquet_path exists nor json_dir provided")
         
         # Use global columns configuration or dataset-specific columns
         columns_to_extract = self.config.columns or dataset_config.columns
@@ -43,58 +48,220 @@ class EndoFactoryEngine:
                     column_exprs.append(pl.lit(None).alias(col))
             df = df.select(column_exprs)
         
-        # Add dataset name column
-        df = df.with_columns(pl.lit(dataset_config.name).alias("source_dataset"))
+        # Add dataset name column only if user wants it (in columns) or no column filter is set
+        if columns_to_extract is None or (isinstance(columns_to_extract, list) and "source_dataset" in columns_to_extract):
+            df = df.with_columns(pl.lit(dataset_config.name).alias("source_dataset"))
         
         # Validate image paths and update absolute paths
         df = self._validate_and_update_image_paths(df, dataset_config)
         
+        return df
+
+    # ============ Ingestion (ColonGPT) ============
+    def ingest_from_input(self) -> Optional[pl.DataFrame]:
+        """If input ingestion is configured, scan JSON and build a parquet.
+
+        Returns the ingested DataFrame if performed, otherwise None.
+        """
+        if not self.config.input or not self.config.ingest_output:
+            return None
+
+        input_cfg = self.config.input
+        ingest_out = self.config.ingest_output
+
+        if input_cfg.inputset != 'ColonGPT':
+            # Currently only ColonGPT is supported as requested
+            return None
+
+        json_dir = Path(input_cfg.json_dir)
+        if not json_dir.exists():
+            raise FileNotFoundError(f"JSON dir not found: {json_dir}")
+
+        records: List[Dict[str, Any]] = []
+        # Scan all json files under json_dir (recursive)
+        for p in json_dir.rglob('*.json'):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read JSON {p}: {e}")
+
+            # Each file may contain a list (recommended) or a single object
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                # Required fields from example: id, image, conversations
+                if not all(k in it for k in ('id', 'image', 'conversations')):
+                    # Skip invalid entries
+                    continue
+
+                rec: Dict[str, Any] = {
+                    'id': it['id'],
+                    'image': it['image'],
+                    'conversations': it['conversations'],
+                }
+
+                # Optional derive image_path
+                if input_cfg.image_path_mode == 'join_id':
+                    # id is a relative path; join with images_root
+                    assert input_cfg.images_root is not None
+                    rec['image_path'] = str(Path(input_cfg.images_root) / it['id'])
+                elif input_cfg.image_path_mode == 'use_existing':
+                    # image field is already an absolute path
+                    # keep as-is; do not add image_path
+                    pass
+
+                # Add a stable uuid for this row
+                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
+
+                records.append(rec)
+
+        if not records:
+            raise ValueError("No valid ColonGPT records found from input JSONs.")
+
+        df = pl.from_dicts(records)
+
+        # Optional filter by dataset prefix (id startswith '<prefix>/')
+        if input_cfg.dataset_prefix:
+            pref = input_cfg.dataset_prefix.rstrip('/') + '/'
+            if 'id' in df.columns:
+                df = df.filter(pl.col('id').str.starts_with(pref))
+
+        # Save to parquet
+        out_path = Path(ingest_out.parquet_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(out_path)
+
+        # Optionally register as a dataset source for subsequent build
+        # Users may already list datasets referencing this parquet; we don't mutate config here.
+        return df
+    
+    def _ingest_dataset_from_json(self, dataset_config: DatasetConfig) -> pl.DataFrame:
+        """Directly ingest a dataset from JSON files without intermediate parquet."""
+        json_dir = Path(dataset_config.json_dir)
+        if not json_dir.exists():
+            raise FileNotFoundError(f"JSON dir not found: {json_dir}")
+
+        records: List[Dict[str, Any]] = []
+        # Scan all json files under json_dir (recursive)
+        for p in json_dir.rglob('*.json'):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read JSON {p}: {e}")
+
+            # Each file may contain a list (recommended) or a single object
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                # Required fields from example: id, image, conversations
+                if not all(k in it for k in ('id', 'image', 'conversations')):
+                    # Skip invalid entries
+                    continue
+
+                rec: Dict[str, Any] = {
+                    'id': it['id'],
+                    'image': it['image'],
+                    'conversations': it['conversations'],
+                }
+
+                # Optional derive image_path
+                if dataset_config.auto_absolute_path:
+                    # id is a relative path; join with images_root
+                    rec['image_path'] = str(Path(dataset_config.image_path) / it['id'])
+                elif 'image' in it and Path(it['image']).is_absolute():
+                    # image field is already an absolute path
+                    rec['image_path'] = it['image']
+
+                # Add a stable uuid for this row
+                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
+
+                records.append(rec)
+
+        if not records:
+            raise ValueError(f"No valid ColonGPT records found from JSON dir: {json_dir}")
+
+        df = pl.from_dicts(records)
+
+        # Optional filter by dataset prefix (id startswith '<prefix>/')
+        if dataset_config.dataset_prefix:
+            pref = dataset_config.dataset_prefix.rstrip('/') + '/'
+            if 'id' in df.columns:
+                df = df.filter(pl.col('id').str.starts_with(pref))
+
         return df
     
     def _validate_and_update_image_paths(self, df: pl.DataFrame, dataset_config: DatasetConfig) -> pl.DataFrame:
         """Validate image existence and create absolute paths."""
         image_dir = Path(dataset_config.image_path)
         
-        # Create absolute image paths
+        # If dataset already provides an absolute image_path column (e.g., from ingestion), keep it
+        if 'image_path' in df.columns:
+            return df
+
+        # Create absolute image paths from available identifiers -> standardize to 'image_path'
         if 'uuid' in df.columns:
             df = df.with_columns(
-                (pl.lit(str(image_dir)) + "/" + pl.col("uuid") + ".jpg").alias("absolute_image_path")
+                (pl.lit(str(image_dir)) + "/" + pl.col("uuid") + ".jpg").alias("image_path")
             )
         elif 'filename' in df.columns:
             df = df.with_columns(
-                (pl.lit(str(image_dir)) + "/" + pl.col("filename")).alias("absolute_image_path")
+                (pl.lit(str(image_dir)) + "/" + pl.col("filename")).alias("image_path")
             )
         
         return df
     
     def mix_datasets(self) -> pl.DataFrame:
-        """Mix datasets according to configured proportions."""
+        """Mix datasets according to configured weights.
+
+        New semantics:
+        - weight == 1.0: include the whole dataset once (no downsampling) -> total equals the sum of sizes.
+        - weight < 1.0: downsample without replacement to floor(weight * N).
+        - weight > 1.0: upsample to floor(weight * N) using sampling with replacement for the extra part.
+        """
         if not self.datasets:
             raise ValueError("No datasets loaded. Call load_datasets() first.")
         
-        mixed_dfs = []
-        
-        # Calculate total weight
-        total_weight = sum(config.weight for config in self.config.datasets)
-        
+        mixed_dfs: List[pl.DataFrame] = []
+
         for dataset_config in self.config.datasets:
             df = self.datasets[dataset_config.name]
-            
-            # Calculate sample size based on weight
-            proportion = dataset_config.weight / total_weight
-            sample_size = int(len(df) * proportion)
-            
-            if sample_size > 0:
-                # Sample with seed for reproducibility
-                sampled_df = df.sample(n=min(sample_size, len(df)), seed=self.config.seed)
+            n = len(df)
+            w = dataset_config.weight
+
+            if w == 1 or abs(w - 1.0) < 1e-9:
+                mixed_dfs.append(df)
+                continue
+
+            target = int(n * w)
+            if target <= 0:
+                continue
+
+            if w < 1.0:
+                # downsample without replacement
+                k = min(target, n)
+                sampled_df = df.sample(n=k, with_replacement=False, seed=self.config.seed)
+                mixed_dfs.append(sampled_df)
+            else:
+                # upsample: full copies + partial remainder, with replacement
+                full = target // n
+                rem = target % n
+                parts = []
+                if full > 0:
+                    # repeat full copies
+                    parts.append(pl.concat([df] * full, how="diagonal"))
+                if rem > 0:
+                    parts.append(df.sample(n=rem, with_replacement=True, seed=self.config.seed))
+                sampled_df = pl.concat(parts, how="diagonal") if parts else df.head(0)
                 mixed_dfs.append(sampled_df)
         
         # Combine all datasets
         if mixed_dfs:
             self.mixed_dataset = pl.concat(mixed_dfs, how="diagonal")
             
-            # Apply task/subtask proportions if configured
-            if self.config.task_proportions:
+            # Apply task/subtask proportions if configured and applicable
+            # If inputset is ColonGPT (which has no task/subtask), skip applying proportions
+            if (self.config.task_proportions 
+                and not (self.config.input and self.config.input.inputset == 'ColonGPT')):
                 self.mixed_dataset = self._apply_task_proportions(self.mixed_dataset)
             
             # Shuffle the final dataset

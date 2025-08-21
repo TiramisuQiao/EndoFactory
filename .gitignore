@@ -61,4 +61,4 @@ env/
 # Logs
 logs/
 *.log
-.yaml
+*.yaml

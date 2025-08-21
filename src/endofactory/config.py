@@ -1,6 +1,6 @@
 """Configuration models for EndoFactory dataset construction."""
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Literal
 from pathlib import Path
 from pydantic import BaseModel, Field, validator
 
@@ -10,7 +10,11 @@ class DatasetConfig(BaseModel):
     
     name: str = Field(..., description="Dataset name")
     image_path: Path = Field(..., description="Path to images directory")
-    parquet_path: Path = Field(..., description="Path to parquet metadata file")
+    # Either parquet_path OR json_dir + dataset_prefix for direct ingestion
+    parquet_path: Optional[Path] = Field(default=None, description="Path to parquet metadata file")
+    json_dir: Optional[Path] = Field(default=None, description="Directory containing JSON files for direct ingestion")
+    dataset_prefix: Optional[str] = Field(default=None, description="Dataset prefix filter for JSON ingestion (e.g., 'SUN')")
+    auto_absolute_path: Optional[bool] = Field(default=True, description="Generate absolute paths from images_root + id")
     weight: float = Field(default=1.0, description="Sampling weight for this dataset")
     columns: Optional[List[str]] = Field(default=None, description="Specific columns to extract")
     
@@ -18,6 +22,13 @@ class DatasetConfig(BaseModel):
     def weight_must_be_positive(cls, v):
         if v <= 0:
             raise ValueError('Weight must be positive')
+        return v
+    
+    @validator('json_dir', always=True)
+    def validate_source(cls, v, values):
+        parquet_path = values.get('parquet_path')
+        if v is None and parquet_path is None:
+            raise ValueError('Either parquet_path or json_dir must be provided')
         return v
 
 
@@ -56,6 +67,53 @@ class ExportConfig(BaseModel):
         return v
 
 
+class InputConfig(BaseModel):
+    """Configuration for raw input ingestion stage (e.g., ColonGPT JSON + images)."""
+
+    inputset: Literal['ColonGPT'] = Field(..., description="Type of input set.")
+    json_dir: Path = Field(..., description="Directory containing JSON files to scan")
+    images_root: Optional[Path] = Field(
+        default=None,
+        description="Root directory for images. Required when image_path_mode='join_id'",
+    )
+    dataset_prefix: Optional[str] = Field(
+        default=None,
+        description="Optional dataset prefix to filter records by id (e.g., 'SUN' to include ids starting with 'SUN/')",
+    )
+    # Preferred boolean switch
+    auto_absolute_path: Optional[bool] = Field(
+        default=True,
+        description="If true, join images_root with record 'id' to form image_path; if false, use existing absolute path in JSON",
+    )
+    # Backward-compatible mode; will be inferred from auto_absolute_path if not provided
+    image_path_mode: Optional[Literal['join_id', 'use_existing']] = Field(
+        default=None,
+        description="Deprecated: prefer auto_absolute_path. If provided, overrides auto_absolute_path.",
+    )
+
+    @validator('image_path_mode', always=True)
+    def infer_mode_from_auto(cls, v, values):
+        # If mode is explicitly provided, keep it; otherwise infer from auto_absolute_path
+        if v is not None:
+            return v
+        auto = values.get('auto_absolute_path', True)
+        return 'join_id' if auto else 'use_existing'
+
+    @validator('images_root', always=True)
+    def validate_images_root(cls, v, values):
+        mode = values.get('image_path_mode')
+        if mode == 'join_id' and v is None:
+            raise ValueError("images_root is required when image_path_mode='join_id' (auto_absolute_path=True)")
+        return v
+
+
+class IngestOutputConfig(BaseModel):
+    """Output configuration for the ingestion step producing an intermediate parquet."""
+
+    parquet_path: Path = Field(..., description="Output parquet path for the ingested data")
+    dataset_name: str = Field('ColonGPT', description="Name to tag this ingested dataset")
+
+
 class EndoFactoryConfig(BaseModel):
     """Main configuration for EndoFactory."""
     
@@ -64,6 +122,9 @@ class EndoFactoryConfig(BaseModel):
     task_proportions: Optional[TaskProportionConfig] = Field(default=None)
     export: ExportConfig = Field(..., description="Export configuration")
     seed: int = Field(default=42, description="Random seed for reproducibility")
+    # Optional ingestion configs
+    input: Optional[InputConfig] = Field(default=None, description="Optional raw input ingestion configuration")
+    ingest_output: Optional[IngestOutputConfig] = Field(default=None, description="Optional ingestion output configuration")
     
     class Config:
         extra = "forbid"
