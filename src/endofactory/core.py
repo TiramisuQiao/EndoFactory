@@ -7,6 +7,7 @@ import polars as pl
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .config import EndoFactoryConfig, DatasetConfig
+import logging
 
 
 class EndoFactoryEngine:
@@ -32,32 +33,30 @@ class EndoFactoryEngine:
         - For parquet sources, use column pushdown via read_parquet(columns=...).
         - For JSON sources, use parallel parsing.
         """
-        # Decide columns up-front for pushdown
-        columns_to_extract = self.config.columns or dataset_config.columns
+        # Decide columns spec (can include rename mappings)
+        columns_spec = self.config.columns or dataset_config.columns
 
         # Prefer JSON ingestion if json_dir is provided (even if a parquet also exists)
         if dataset_config.json_dir:
             df = self._ingest_dataset_from_json(dataset_config)
-            # Apply column filter post-ingest if requested
             if df.is_empty():
                 return df
-
-            if columns_to_extract:
-                existing = [c for c in columns_to_extract if c in df.columns]
-                missing = [c for c in columns_to_extract if c not in df.columns]
-                df = df.select(existing + [pl.lit(None).alias(c) for c in missing])
         elif dataset_config.parquet_path and Path(dataset_config.parquet_path).exists():
             # Column pushdown to reduce IO
             try:
-                df = pl.read_parquet(dataset_config.parquet_path, columns=columns_to_extract)
+                # Pushdown only for simple string columns (no rename at read time)
+                push_cols = None
+                if columns_spec:
+                    push_cols = [c for c in self._columns_sources(columns_spec) if isinstance(c, str)]
+                df = pl.read_parquet(dataset_config.parquet_path, columns=push_cols)
             except Exception:
                 # Fallback without columns in case of schema mismatch
                 df = pl.read_parquet(dataset_config.parquet_path)
         else:
             raise ValueError(f"Dataset {dataset_config.name}: neither parquet_path exists nor json_dir provided")
 
-        # Add dataset name column only if user wants it (in columns) or no column filter is set
-        if columns_to_extract is None or (isinstance(columns_to_extract, list) and "source_dataset" in columns_to_extract):
+        # Add dataset name column only if user wants it (in columns spec) or no column filter is set
+        if columns_spec is None or (isinstance(columns_spec, list) and ("source_dataset" in self._columns_sources(columns_spec))):
             df = df.with_columns(pl.lit(dataset_config.name).alias("source_dataset"))
 
         # Optional categorical casting to reduce memory
@@ -68,6 +67,34 @@ class EndoFactoryEngine:
 
         # Validate image paths and update absolute paths
         df = self._validate_and_update_image_paths(df, dataset_config)
+
+        # Apply column selection and renaming AFTER validation
+        if columns_spec:
+            src_cols = [c for c in self._columns_sources(columns_spec) if c in df.columns]
+            df = df.select(src_cols)
+            rename_map = self._columns_rename_map(columns_spec)
+            # Only rename keys that exist
+            rename_map = {k: v for k, v in rename_map.items() if k in df.columns and v}
+            if rename_map:
+                df = df.rename(rename_map)
+
+        # Prune all-null columns
+        if len(df.columns) > 0 and len(df) > 0:
+            keep_cols: List[str] = []
+            for c in df.columns:
+                try:
+                    has_any = df.select(pl.col(c).is_not_null().any()).item()
+                except Exception:
+                    has_any = True
+                if has_any:
+                    keep_cols.append(c)
+            if set(keep_cols) != set(df.columns):
+                df = df.select(keep_cols)
+
+        # Prune rows that are entirely null across remaining columns
+        if len(df.columns) > 0 and len(df) > 0:
+            any_not_null = pl.any_horizontal([pl.col(c).is_not_null() for c in df.columns])
+            df = df.filter(any_not_null)
 
         return df
 
@@ -91,12 +118,35 @@ class EndoFactoryEngine:
         if not json_dir.exists():
             raise FileNotFoundError(f"JSON dir not found: {json_dir}")
 
+        # 1) Prefer cache
+        cache_path = self._colon_gpt_cache_path(json_dir)
+        if cache_path.exists():
+            try:
+                df_all = pl.read_parquet(cache_path)
+                # If a prefix is requested, filter subset
+                if input_cfg.dataset_prefix:
+                    pref = input_cfg.dataset_prefix.rstrip('/') + '/'
+                    df = df_all.filter(pl.col('id').str.starts_with(pref))
+                else:
+                    df = df_all
+                # Also mirror to ingest_output for downstream steps
+                out_path = Path(ingest_out.parquet_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                df.write_parquet(out_path)
+                logging.debug(f"Loaded ColonGPT cache: {cache_path} -> wrote to ingest_output: {out_path}")
+                return df
+            except Exception as e:
+                logging.debug(f"Failed to read ColonGPT cache {cache_path}: {e}. Falling back to scanning.")
+
+        # 2) No cache or cache failed -> try to build cache from scan
+        # Build union cache regardless of prefix (faster future runs)
         records = self._scan_json_records(
             json_dir=json_dir,
             derive_image_mode=input_cfg.image_path_mode,
             images_root=input_cfg.images_root,
-            dataset_prefix=input_cfg.dataset_prefix,
+            dataset_prefix=None,
             num_workers=self.config.num_workers,
+            add_uuid=bool(input_cfg.add_uuid),
         )
 
         if not records:
@@ -111,16 +161,32 @@ class EndoFactoryEngine:
             )
             return empty_df
 
-        df = pl.from_dicts(records)
+        df_all = pl.from_dicts(records)
 
-        # Save to parquet
-        out_path = Path(ingest_out.parquet_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        df.write_parquet(out_path)
+        # Try writing both cache and ingest_output; failures shouldn't block downstream use
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df_all.write_parquet(cache_path)
+            logging.debug(f"Created ColonGPT cache at {cache_path}")
+        except Exception as e:
+            logging.debug(f"Failed to write ColonGPT cache at {cache_path}: {e}")
 
-        # Optionally register as a dataset source for subsequent build
-        # Users may already list datasets referencing this parquet; we don't mutate config here.
-        return df
+        try:
+            out_path = Path(ingest_out.parquet_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            # Return the requested subset to downstream
+            if input_cfg.dataset_prefix:
+                pref = input_cfg.dataset_prefix.rstrip('/') + '/'
+                df_subset = df_all.filter(pl.col('id').str.starts_with(pref))
+                df_subset.write_parquet(out_path)
+                return df_subset
+            else:
+                df_all.write_parquet(out_path)
+                return df_all
+        except Exception as e:
+            logging.debug(f"Failed to write ingest_output parquet at {out_path}: {e}")
+        # If mirroring failed, still return in-memory subset/all
+        return df_subset if 'df_subset' in locals() else df_all
     
     def _ingest_dataset_from_json(self, dataset_config: DatasetConfig) -> pl.DataFrame:
         """Directly ingest a dataset from JSON files without intermediate parquet."""
@@ -128,12 +194,26 @@ class EndoFactoryEngine:
         if not json_dir.exists():
             raise FileNotFoundError(f"JSON dir not found: {json_dir}")
 
+        # Prefer cache
+        cache_path = self._colon_gpt_cache_path(json_dir)
+        if cache_path.exists():
+            try:
+                df_all = pl.read_parquet(cache_path)
+                if dataset_config.dataset_prefix:
+                    pref = dataset_config.dataset_prefix.rstrip('/') + '/'
+                    return df_all.filter(pl.col('id').str.starts_with(pref))
+                return df_all
+            except Exception as e:
+                logging.debug(f"Failed to read ColonGPT cache {cache_path}: {e}. Falling back to scanning.")
+
+        # Build union cache on miss
         records = self._scan_json_records(
             json_dir=json_dir,
             derive_image_mode='join_id' if dataset_config.auto_absolute_path else 'use_existing',
             images_root=dataset_config.image_path,
-            dataset_prefix=dataset_config.dataset_prefix,
+            dataset_prefix=None,
             num_workers=self.config.num_workers,
+            add_uuid=False,
         )
 
         if not records:
@@ -147,11 +227,46 @@ class EndoFactoryEngine:
             )
             return pl.DataFrame([])
 
-        df = pl.from_dicts(records)
+        df_all = pl.from_dicts(records)
 
-        return df
+        # Try to write cache for future runs
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df_all.write_parquet(cache_path)
+            logging.debug(f"Created ColonGPT cache at {cache_path}")
+        except Exception as e:
+            logging.debug(f"Failed to write ColonGPT cache at {cache_path}: {e}")
+        if dataset_config.dataset_prefix:
+            pref = dataset_config.dataset_prefix.rstrip('/') + '/'
+            return df_all.filter(pl.col('id').str.starts_with(pref))
+        return df_all
 
     # ---------------- Internal helpers ----------------
+    def _columns_sources(self, spec: Optional[List[Union[str, Dict[str, str]]]]) -> List[str]:
+        if not spec:
+            return []
+        sources: List[str] = []
+        for item in spec:
+            if isinstance(item, str):
+                sources.append(item)
+            elif isinstance(item, dict):
+                # expect one-key mapping
+                for k in item.keys():
+                    sources.append(k)
+        return sources
+
+    def _columns_rename_map(self, spec: Optional[List[Union[str, Dict[str, str]]]]) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        if not spec:
+            return mapping
+        for item in spec:
+            if isinstance(item, dict):
+                # take first mapping only per dict entry
+                for k, v in item.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        mapping[k] = v
+                        break
+        return mapping
     def _scan_json_records(
         self,
         json_dir: Path,
@@ -159,6 +274,7 @@ class EndoFactoryEngine:
         images_root: Optional[Path],
         dataset_prefix: Optional[str],
         num_workers: Optional[int],
+        add_uuid: bool,
     ) -> List[Dict[str, Any]]:
         """Scan JSON files in parallel and return normalized records.
 
@@ -209,7 +325,8 @@ class EndoFactoryEngine:
                 elif derive_image_mode == 'use_existing' and 'image' in it and Path(it['image']).is_absolute():
                     rec['image_path'] = it['image']
 
-                rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
+                if add_uuid:
+                    rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
                 out.append(rec)
             return {
                 'records': out,
@@ -250,6 +367,15 @@ class EndoFactoryEngine:
             'decode_errors': locals().get('decode_errors', 0),
         }
         return results
+
+    # ---------------- Cache helpers ----------------
+    def _colon_gpt_cache_path(self, json_dir: Path) -> Path:
+        """Return the union parquet cache path for ColonGPT items under given json_dir.
+
+        Cache layout: <json_dir>/.endofactory_cache/cache_all.parquet
+        """
+        cache_dir = Path(json_dir) / ".endofactory_cache"
+        return cache_dir / "cache_all.parquet"
     
     def _validate_and_update_image_paths(self, df: pl.DataFrame, dataset_config: DatasetConfig) -> pl.DataFrame:
         """Validate image existence and create absolute paths."""
@@ -327,6 +453,9 @@ class EndoFactoryEngine:
             
             # Shuffle the final dataset
             self.mixed_dataset = self.mixed_dataset.sample(fraction=1.0, seed=self.config.seed)
+
+            # Final prune: remove columns that are all null and rows that are all null
+            self.mixed_dataset = self._prune_nulls(self.mixed_dataset)
         
         return self.mixed_dataset
     
@@ -367,16 +496,99 @@ class EndoFactoryEngine:
         if self.mixed_dataset is None:
             raise ValueError("No mixed dataset available. Call mix_datasets() first.")
         
+        # Enforce final column set if columns spec provided
+        columns_spec = self.config.columns
+        df = self.mixed_dataset
+        if columns_spec:
+            rename_map = self._columns_rename_map(columns_spec)
+            # target names are: mapping values for dict entries, and raw names for string entries
+            targets: List[str] = []
+            for item in columns_spec or []:
+                if isinstance(item, str):
+                    # Accept either original or renamed: map to target if applicable
+                    tgt = rename_map.get(item, item)
+                    targets.append(tgt)
+                elif isinstance(item, dict):
+                    for _, v in item.items():
+                        if isinstance(v, str):
+                            targets.append(v)
+                            break
+            # Keep intersection
+            keep_final = [c for c in targets if c in df.columns]
+            if keep_final:
+                df = df.select(keep_final)
+        # Apply listification after final column selection/rename
+        if getattr(self.config, 'listify_columns', None):
+            # Resolve listify names through rename_map when needed so users can specify either original or renamed
+            rename_map = self._columns_rename_map(self.config.columns) if self.config.columns else {}
+            resolved = []
+            for name in (self.config.listify_columns or []):
+                if name in df.columns:
+                    resolved.append(name)
+                else:
+                    tgt = rename_map.get(name)
+                    if tgt and tgt in df.columns:
+                        resolved.append(tgt)
+            list_targets = list(dict.fromkeys(resolved))
+            if list_targets:
+                schema = df.schema
+                exprs = []
+                for c in df.columns:
+                    if c in list_targets:
+                        dt = schema.get(c)
+                        # If already a list type, keep as-is
+                        if isinstance(dt, pl.datatypes.List):
+                            exprs.append(pl.col(c))
+                        else:
+                            # Determine list inner dtype
+                            inner = pl.Utf8 if dt in (pl.Utf8, pl.Categorical) else dt
+                            target_dtype = pl.List(inner)
+                            base_expr = pl.col(c)
+                            if dt is pl.Categorical:
+                                base_expr = base_expr.cast(pl.Utf8)
+                            exprs.append(
+                                base_expr.map_elements(
+                                    lambda x: None if x is None else (x if isinstance(x, list) else [x]),
+                                    return_dtype=target_dtype,
+                                ).alias(c)
+                            )
+                    else:
+                        exprs.append(pl.col(c))
+                df = df.select(exprs)
+
+        # Final prune before writing
+        df = self._prune_nulls(df)
+
         output_path = Path(self.config.export.output_path)
         output_path.mkdir(parents=True, exist_ok=True)
         
         if self.config.export.format == "parquet":
             output_file = output_path / "endovqa_dataset.parquet"
-            self.mixed_dataset.write_parquet(output_file)
+            df.write_parquet(output_file)
         
         elif self.config.export.format == "jsonl":
             output_file = output_path / "endovqa_dataset.jsonl"
-            self._export_jsonl(output_file)
+            # Export df computed above rather than mixed_dataset
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for row in df.iter_rows(named=True):
+                    json.dump(row, f, ensure_ascii=False)
+                    f.write('\n')
+        
+        elif self.config.export.format == "json":
+            output_file = output_path / "endovqa_dataset.json"
+            # Stream as a JSON array with pretty formatting (multiline, commas between cases)
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write('[\n')
+                first = True
+                for row in df.iter_rows(named=True):
+                    if not first:
+                        f.write(',\n')
+                    # Pretty dump each object and indent it by two spaces
+                    obj = json.dumps(row, ensure_ascii=False, indent=2)
+                    obj = '  ' + obj.replace('\n', '\n  ')
+                    f.write(obj)
+                    first = False
+                f.write('\n]\n')
         
         return output_file
     
@@ -386,6 +598,28 @@ class EndoFactoryEngine:
             for row in self.mixed_dataset.iter_rows(named=True):
                 json.dump(row, f, ensure_ascii=False)
                 f.write('\n')
+
+    def _prune_nulls(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Drop all-null columns and all-null rows for cleanliness."""
+        if len(df.columns) == 0 or len(df) == 0:
+            return df
+        # drop columns that are entirely null
+        keep_cols: List[str] = []
+        for c in df.columns:
+            try:
+                has_any = df.select(pl.col(c).is_not_null().any()).item()
+            except Exception:
+                has_any = True
+            if has_any:
+                keep_cols.append(c)
+        if set(keep_cols) != set(df.columns):
+            df = df.select(keep_cols)
+        if len(df.columns) == 0 or len(df) == 0:
+            return df
+        # drop rows that are entirely null
+        any_not_null = pl.any_horizontal([pl.col(c).is_not_null() for c in df.columns])
+        df = df.filter(any_not_null)
+        return df
     
     def get_dataset_stats(self) -> Dict:
         """Get statistics about loaded datasets."""

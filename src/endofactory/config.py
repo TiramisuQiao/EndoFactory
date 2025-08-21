@@ -16,7 +16,11 @@ class DatasetConfig(BaseModel):
     dataset_prefix: Optional[str] = Field(default=None, description="Dataset prefix filter for JSON ingestion (e.g., 'SUN')")
     auto_absolute_path: Optional[bool] = Field(default=True, description="Generate absolute paths from images_root + id")
     weight: float = Field(default=1.0, description="Sampling weight for this dataset")
-    columns: Optional[List[str]] = Field(default=None, description="Specific columns to extract")
+    # Columns can be a list of strings (source names) or list of {source: target} mappings for rename
+    columns: Optional[List[Union[str, Dict[str, str]]]] = Field(
+        default=None,
+        description="Specific columns to extract; support rename via list of one-key dicts, e.g., [{'image_path': 'path'}]",
+    )
     
     @validator('weight')
     def weight_must_be_positive(cls, v):
@@ -57,13 +61,13 @@ class ExportConfig(BaseModel):
     """Configuration for export settings."""
     
     output_path: Path = Field(..., description="Output directory path")
-    format: str = Field(default="parquet", description="Export format: 'parquet' or 'jsonl'")
+    format: str = Field(default="parquet", description="Export format: 'parquet', 'json', or 'jsonl'")
     include_absolute_paths: bool = Field(default=True, description="Include absolute image paths")
     
     @validator('format')
     def format_must_be_valid(cls, v):
-        if v not in ['parquet', 'jsonl']:
-            raise ValueError('Format must be either "parquet" or "jsonl"')
+        if v not in ['parquet', 'json', 'jsonl']:
+            raise ValueError('Format must be one of "parquet", "json", or "jsonl"')
         return v
 
 
@@ -79,6 +83,10 @@ class InputConfig(BaseModel):
     dataset_prefix: Optional[str] = Field(
         default=None,
         description="Optional dataset prefix to filter records by id (e.g., 'SUN' to include ids starting with 'SUN/')",
+    )
+    add_uuid: Optional[bool] = Field(
+        default=False,
+        description="If true, generate a deterministic uuid column from id during ingestion.",
     )
     # Preferred boolean switch
     auto_absolute_path: Optional[bool] = Field(
@@ -118,10 +126,19 @@ class EndoFactoryConfig(BaseModel):
     """Main configuration for EndoFactory."""
     
     datasets: List[DatasetConfig] = Field(..., description="List of dataset configurations")
-    columns: Optional[List[str]] = Field(default=None, description="Global columns to extract from all datasets")
+    # Global columns with same semantics as DatasetConfig.columns
+    columns: Optional[List[Union[str, Dict[str, str]]]] = Field(
+        default=None,
+        description="Global columns to extract; support rename via list of one-key dicts.",
+    )
     task_proportions: Optional[TaskProportionConfig] = Field(default=None)
     export: ExportConfig = Field(..., description="Export configuration")
     seed: int = Field(default=42, description="Random seed for reproducibility")
+    # Convert selected columns to list type (wrap scalar into single-element list)
+    listify_columns: Optional[List[str]] = Field(
+        default=None,
+        description="Columns to convert to List type by wrapping non-null scalar values into a single-element list. Applied after rename.",
+    )
     # Optional ingestion configs
     input: Optional[InputConfig] = Field(default=None, description="Optional raw input ingestion configuration")
     ingest_output: Optional[IngestOutputConfig] = Field(default=None, description="Optional ingestion output configuration")

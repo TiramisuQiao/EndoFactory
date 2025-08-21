@@ -23,10 +23,10 @@ setup(
     long_description_content_type="text/markdown",
     author="TiramisuQiao",
     author_email="tlmsq@outlook.com",
-    url="https://github.com/your-org/EndoFactory",
+    url="https://github.com/TiramisuQiao/EndoFactory",
     project_urls={
-        "Repository": "https://github.com/your-org/EndoFactory",
-        "Issues": "https://github.com/your-org/EndoFactory/issues",
+        "Repository": "https://github.com/TiramisuQiao/EndoFactory",
+        "Issues": "https://github.com/TiramisuQiao/EndoFactoryissues",
     },
     license="MIT",
     keywords=["endoscopy", "medical", "VQA", "dataset", "polars", "yaml", "cli"],

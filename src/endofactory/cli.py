@@ -8,10 +8,31 @@ from rich.table import Table
 from rich import print as rprint
 from .yaml_loader import YAMLConfigLoader
 from .core import EndoFactoryEngine
+import logging
+import os
+import shutil
 
 app = typer.Typer(help="EndoFactory: Revolutionary EndoVQA dataset construction tool")
 console = Console()
 
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging and rich tracebacks"),
+):
+    """Global options for the EndoFactory CLI."""
+    if debug:
+        # Enable DEBUG logging for the application
+        os.environ["ENDOFACTORY_DEBUG"] = "1"
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
+        try:
+            from rich.traceback import install as _rt_install
+            _rt_install(show_locals=True)
+        except Exception:
+            # Rich may not be available in some environments; continue without it
+            pass
+        rprint("🐞 [bold yellow]Debug mode enabled[/bold yellow]")
 
 @app.command()
 def create_config(
@@ -532,6 +553,29 @@ def _display_dataset_stats(stats: dict, is_colon_gpt: bool = False):
             rprint("📊 Source Distribution:")
             for source, count in stats['mixed_dataset']['source_distribution'].items():
                 rprint(f"  • {source}: {count} samples")
+
+
+@app.command()
+def clear_cache(
+    scan_dir: Path = typer.Argument(..., help="ColonGPT base directory containing Json-file/ and Positive-images/"),
+):
+    """Clear ColonGPT union parquet cache(s) under Json-file/*/.endofactory_cache.
+
+    It removes the directory `.endofactory_cache` in both Json-file/train and Json-file/test if present.
+    """
+    removed = []
+    for split in ["train", "test"]:
+        cache_dir = scan_dir / "Json-file" / split / ".endofactory_cache"
+        if cache_dir.exists() and cache_dir.is_dir():
+            try:
+                shutil.rmtree(cache_dir)
+                removed.append(str(cache_dir))
+            except Exception as e:
+                rprint(f"❌ Failed to remove cache dir {cache_dir}: {e}")
+    if removed:
+        rprint("🧹 Removed caches:\n" + "\n".join(f"  • {p}" for p in removed))
+    else:
+        rprint("ℹ️  No cache directories found to remove.")
 
 
 if __name__ == "__main__":
