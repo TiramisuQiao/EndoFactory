@@ -2,7 +2,9 @@
 
 from typing import Dict, List, Optional, Union, Literal
 from pathlib import Path
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
+from pydantic import field_validator, model_validator
+from pydantic import ConfigDict
 
 
 class DatasetConfig(BaseModel):
@@ -21,19 +23,19 @@ class DatasetConfig(BaseModel):
         default=None,
         description="Specific columns to extract; support rename via list of one-key dicts, e.g., [{'image_path': 'path'}]",
     )
-    
-    @validator('weight')
-    def weight_must_be_positive(cls, v):
+
+    @field_validator('weight')
+    @classmethod
+    def weight_must_be_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError('Weight must be positive')
         return v
-    
-    @validator('json_dir', always=True)
-    def validate_source(cls, v, values):
-        parquet_path = values.get('parquet_path')
-        if v is None and parquet_path is None:
+
+    @model_validator(mode='after')
+    def _check_source(self):
+        if self.parquet_path is None and self.json_dir is None:
             raise ValueError('Either parquet_path or json_dir must be provided')
-        return v
+        return self
 
 
 class TaskProportionConfig(BaseModel):
@@ -41,20 +43,18 @@ class TaskProportionConfig(BaseModel):
     
     task_proportions: Dict[str, float] = Field(default_factory=dict)
     subtask_proportions: Dict[str, Dict[str, float]] = Field(default_factory=dict)
-    
-    @validator('task_proportions', 'subtask_proportions')
-    def proportions_must_sum_to_one(cls, v):
-        if isinstance(v, dict) and v:
-            for key, proportions in v.items():
-                if isinstance(proportions, dict):
+
+    @model_validator(mode='after')
+    def _check_proportions(self):
+        # Do NOT enforce sum on task_proportions (kept for backward compatibility/tests)
+        # Only check each subtask family sums to 1
+        if self.subtask_proportions:
+            for key, proportions in self.subtask_proportions.items():
+                if isinstance(proportions, dict) and proportions:
                     total = sum(proportions.values())
                     if abs(total - 1.0) > 1e-6:
                         raise ValueError(f'Proportions for {key} must sum to 1.0, got {total}')
-                elif isinstance(v, dict) and key == 'task_proportions':
-                    total = sum(v.values())
-                    if abs(total - 1.0) > 1e-6:
-                        raise ValueError(f'Task proportions must sum to 1.0, got {total}')
-        return v
+        return self
 
 
 class ExportConfig(BaseModel):
@@ -63,9 +63,10 @@ class ExportConfig(BaseModel):
     output_path: Path = Field(..., description="Output directory path")
     format: str = Field(default="parquet", description="Export format: 'parquet', 'json', or 'jsonl'")
     include_absolute_paths: bool = Field(default=True, description="Include absolute image paths")
-    
-    @validator('format')
-    def format_must_be_valid(cls, v):
+
+    @field_validator('format')
+    @classmethod
+    def format_must_be_valid(cls, v: str) -> str:
         if v not in ['parquet', 'json', 'jsonl']:
             raise ValueError('Format must be one of "parquet", "json", or "jsonl"')
         return v
@@ -99,20 +100,15 @@ class InputConfig(BaseModel):
         description="Deprecated: prefer auto_absolute_path. If provided, overrides auto_absolute_path.",
     )
 
-    @validator('image_path_mode', always=True)
-    def infer_mode_from_auto(cls, v, values):
-        # If mode is explicitly provided, keep it; otherwise infer from auto_absolute_path
-        if v is not None:
-            return v
-        auto = values.get('auto_absolute_path', True)
-        return 'join_id' if auto else 'use_existing'
-
-    @validator('images_root', always=True)
-    def validate_images_root(cls, v, values):
-        mode = values.get('image_path_mode')
-        if mode == 'join_id' and v is None:
+    @model_validator(mode='after')
+    def _infer_and_validate_paths(self):
+        # Infer image_path_mode from auto_absolute_path if not provided
+        if self.image_path_mode is None:
+            self.image_path_mode = 'join_id' if (self.auto_absolute_path is True) else 'use_existing'
+        # Validate images_root when required
+        if self.image_path_mode == 'join_id' and self.images_root is None:
             raise ValueError("images_root is required when image_path_mode='join_id' (auto_absolute_path=True)")
-        return v
+        return self
 
 
 class IngestOutputConfig(BaseModel):
@@ -151,6 +147,6 @@ class EndoFactoryConfig(BaseModel):
         default=None,
         description="Optional list of column names to cast to categorical to reduce memory footprint.",
     )
-    
-    class Config:
-        extra = "forbid"
+
+    # Pydantic v2 config
+    model_config = ConfigDict(extra='forbid')

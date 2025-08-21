@@ -20,7 +20,7 @@ class YAMLConfigLoader:
     @staticmethod
     def save_config(config: EndoFactoryConfig, output_path: Path) -> None:
         """Save configuration to YAML file."""
-        config_dict = config.dict()
+        config_dict = config.model_dump()
         
         # Convert Path objects to strings for YAML serialization
         YAMLConfigLoader._convert_paths_to_strings(config_dict)
