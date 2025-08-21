@@ -283,6 +283,10 @@ def build(
         if verbose:
             rprint("🔀 Mixing datasets...")
         mixed_df = engine.mix_datasets()
+
+        if mixed_df is None or len(mixed_df) == 0:
+            rprint("ℹ️ No samples available to mix or export. Skipping file generation.")
+            return
         
         # Export dataset
         if verbose:
@@ -493,7 +497,7 @@ def _display_dataset_stats(stats: dict, is_colon_gpt: bool = False):
             if name != "mixed_dataset":
                 table.add_row(
                     name,
-                    str(stat["total_samples"])
+                    str(stat.get("total_samples", 0))
                 )
     else:
         # Full table for other dataset types

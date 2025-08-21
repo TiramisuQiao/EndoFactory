@@ -4,7 +4,6 @@
 
 Revolutionary tool for constructing EndoVQA datasets through YAML configuration.
 
-
 [![codecov](https://codecov.io/github/TiramisuQiao/EndoFactory/graph/badge.svg?token=N4SZ3BLO4P)](https://codecov.io/github/TiramisuQiao/EndoFactory)
 
 ## Quick Start

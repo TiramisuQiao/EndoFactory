@@ -16,6 +16,8 @@ class EndoFactoryEngine:
         self.config = config
         self.datasets: Dict[str, pl.DataFrame] = {}
         self.mixed_dataset: Optional[pl.DataFrame] = None
+        # Diagnostics for last ingestion/scan
+        self.last_ingest_diag: Optional[Dict[str, Any]] = None
         
     def load_datasets(self) -> None:
         """Load all configured datasets into memory."""
@@ -33,21 +35,24 @@ class EndoFactoryEngine:
         # Decide columns up-front for pushdown
         columns_to_extract = self.config.columns or dataset_config.columns
 
-        if dataset_config.parquet_path and Path(dataset_config.parquet_path).exists():
+        # Prefer JSON ingestion if json_dir is provided (even if a parquet also exists)
+        if dataset_config.json_dir:
+            df = self._ingest_dataset_from_json(dataset_config)
+            # Apply column filter post-ingest if requested
+            if df.is_empty():
+                return df
+
+            if columns_to_extract:
+                existing = [c for c in columns_to_extract if c in df.columns]
+                missing = [c for c in columns_to_extract if c not in df.columns]
+                df = df.select(existing + [pl.lit(None).alias(c) for c in missing])
+        elif dataset_config.parquet_path and Path(dataset_config.parquet_path).exists():
             # Column pushdown to reduce IO
             try:
                 df = pl.read_parquet(dataset_config.parquet_path, columns=columns_to_extract)
             except Exception:
                 # Fallback without columns in case of schema mismatch
                 df = pl.read_parquet(dataset_config.parquet_path)
-        elif dataset_config.json_dir:
-            df = self._ingest_dataset_from_json(dataset_config)
-            # Apply column filter post-ingest if requested
-            if columns_to_extract:
-                # Select existing + add nulls for missing
-                existing = [c for c in columns_to_extract if c in df.columns]
-                missing = [c for c in columns_to_extract if c not in df.columns]
-                df = df.select(existing + [pl.lit(None).alias(c) for c in missing])
         else:
             raise ValueError(f"Dataset {dataset_config.name}: neither parquet_path exists nor json_dir provided")
 
@@ -95,7 +100,16 @@ class EndoFactoryEngine:
         )
 
         if not records:
-            raise ValueError("No valid ColonGPT records found from input JSONs.")
+            # Tolerant behavior: do not write any parquet; return empty DataFrame and print diagnostics
+            diag = self.last_ingest_diag or {}
+            empty_df = pl.DataFrame([])
+            print(
+                "Info: No valid ColonGPT records found. Skipping parquet output. "
+                f"Diagnostics: files_scanned={diag.get('files_scanned', 0)}, "
+                f"items_total={diag.get('items_total', 0)}, invalid_missing_keys={diag.get('invalid_missing_keys', 0)}, "
+                f"filtered_by_prefix={diag.get('filtered_by_prefix', 0)}, decode_errors={diag.get('decode_errors', 0)}"
+            )
+            return empty_df
 
         df = pl.from_dicts(records)
 
@@ -123,7 +137,15 @@ class EndoFactoryEngine:
         )
 
         if not records:
-            raise ValueError(f"No valid ColonGPT records found from JSON dir: {json_dir}")
+            # Tolerant behavior: return empty DataFrame; caller continues gracefully
+            diag = self.last_ingest_diag or {}
+            print(
+                "Info: No valid ColonGPT records found. Skipping dataset. "
+                f"Diagnostics: files_scanned={diag.get('files_scanned', 0)}, "
+                f"items_total={diag.get('items_total', 0)}, invalid_missing_keys={diag.get('invalid_missing_keys', 0)}, "
+                f"filtered_by_prefix={diag.get('filtered_by_prefix', 0)}, decode_errors={diag.get('decode_errors', 0)}"
+            )
+            return pl.DataFrame([])
 
         df = pl.from_dicts(records)
 
@@ -145,19 +167,36 @@ class EndoFactoryEngine:
         """
         files = list(json_dir.rglob('*.json'))
         if not files:
+            self.last_ingest_diag = {
+                'files_scanned': 0,
+                'items_total': 0,
+                'invalid_missing_keys': 0,
+                'filtered_by_prefix': 0,
+                'decode_errors': 0,
+            }
             return []
 
-        def parse_file(p: Path) -> List[Dict[str, Any]]:
+        def parse_file(p: Path) -> Dict[str, Any]:
             try:
                 with open(p, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+            except json.JSONDecodeError:
+                # Tolerate empty/invalid JSON files: treat as zero items, record decode error
+                return {
+                    'records': [],
+                    'items_total': 0,
+                    'invalid_missing': 0,
+                    'decode_error': True,
+                }
             except Exception as e:
                 raise RuntimeError(f"Failed to read JSON {p}: {e}")
 
             items = data if isinstance(data, list) else [data]
             out: List[Dict[str, Any]] = []
+            invalid_missing = 0
             for it in items:
                 if not all(k in it for k in ('id', 'image', 'conversations')):
+                    invalid_missing += 1
                     continue
                 rec: Dict[str, Any] = {
                     'id': it['id'],
@@ -172,20 +211,44 @@ class EndoFactoryEngine:
 
                 rec['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_URL, rec['id']))
                 out.append(rec)
-            return out
+            return {
+                'records': out,
+                'items_total': len(items),
+                'invalid_missing': invalid_missing,
+                'decode_error': False,
+            }
 
         max_workers = num_workers if (num_workers and num_workers > 0) else min(32, len(files)) or 1
         results: List[Dict[str, Any]] = []
+        items_total = 0
+        invalid_missing_keys = 0
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(parse_file, p): p for p in files}
             for fut in as_completed(futures):
-                results.extend(fut.result())
+                res = fut.result()
+                results.extend(res['records'])
+                items_total += res['items_total']
+                invalid_missing_keys += res['invalid_missing']
+                # count decode errors
+                decode_err = 1 if res.get('decode_error') else 0
+                decode_errors = locals().get('decode_errors', 0) + decode_err
 
         # Optional prefix filter
+        filtered_by_prefix = 0
         if dataset_prefix:
             pref = dataset_prefix.rstrip('/') + '/'
+            before = len(results)
             results = [r for r in results if str(r.get('id', '')).startswith(pref)]
+            filtered_by_prefix = before - len(results)
 
+        # Save diagnostics
+        self.last_ingest_diag = {
+            'files_scanned': len(files),
+            'items_total': items_total,
+            'invalid_missing_keys': invalid_missing_keys,
+            'filtered_by_prefix': filtered_by_prefix,
+            'decode_errors': locals().get('decode_errors', 0),
+        }
         return results
     
     def _validate_and_update_image_paths(self, df: pl.DataFrame, dataset_config: DatasetConfig) -> pl.DataFrame:

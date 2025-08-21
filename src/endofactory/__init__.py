@@ -4,7 +4,7 @@ from .config import EndoFactoryConfig, DatasetConfig, TaskProportionConfig, Expo
 from .core import EndoFactoryEngine
 from .yaml_loader import YAMLConfigLoader
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = [
     "EndoFactoryConfig",
     "DatasetConfig", 
